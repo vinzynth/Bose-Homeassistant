@@ -11,7 +11,7 @@ from pybose.BoseResponse import (
     ContentNowPlaying,
     SystemInfo,
 )
-from pybose.BoseSpeaker import BoseSpeaker
+from pybose.BoseSpeaker import BoseRequestException, BoseSpeaker
 import pychromecast
 from pychromecast import discovery
 from pychromecast.discovery import CastBrowser, SimpleCastListener
@@ -935,6 +935,57 @@ class BoseMediaPlayer(BoseBaseEntity, MediaPlayerEntity):
             ),
         )
 
+    @staticmethod
+    async def _add_to_active_group_idempotent(
+        speaker: BoseSpeaker, group_id, guids
+    ) -> None:
+        """Add members to an active group, tolerating an already-matching group.
+
+        Bose returns HTTP 500 "Error #17 - No changes to active group. No
+        products added/removed, no role changes" when the requested membership
+        already matches the speaker's current group. Home Assistant service
+        calls are expected to be idempotent - automations re-assert desired
+        state routinely - so treat that specific response as success rather
+        than letting it surface as an unhandled BoseRequestException.
+        """
+        try:
+            await speaker.add_to_active_group(group_id, guids)
+        except BoseRequestException as err:
+            if "No changes to active group" in str(err):
+                _LOGGER.debug(
+                    "Bose group already matches the requested members, "
+                    "treating join as a no-op: %s",
+                    err,
+                )
+                return
+            raise
+
+    @staticmethod
+    async def _leave_group_idempotent(coro) -> None:
+        """Await a group-teardown call, tolerating a group that no longer exists.
+
+        Bose returns HTTP 500 "Error #17 - activeGroupId does not correspond to
+        any known group! Dropping!" when Home Assistant still believes a group
+        exists that the speaker has already torn down (upstream issue #76).
+        The desired end state - this speaker not grouped - already holds, so
+        treat it as success rather than raising and requiring an HA restart.
+        """
+        try:
+            await coro
+        except BoseRequestException as err:
+            text = str(err)
+            if (
+                "does not correspond to any known group" in text
+                or "No changes to active group" in text
+            ):
+                _LOGGER.debug(
+                    "Bose reports no matching active group, "
+                    "treating unjoin as a no-op: %s",
+                    err,
+                )
+                return
+            raise
+
     async def async_join_players(self, group_members: list[str]) -> None:
         """Join `group_members` as a player group with the current player."""
         registry = er.async_get(self.hass)
@@ -961,10 +1012,14 @@ class BoseMediaPlayer(BoseBaseEntity, MediaPlayerEntity):
                 master: BoseSpeaker = self.hass.data[DOMAIN][
                     registry.async_get(master_id).config_entry_id
                 ]["speaker"]
-                await master.add_to_active_group(self._active_group_id, guids)
+                await self._add_to_active_group_idempotent(
+                    master, self._active_group_id, guids
+                )
                 return
 
-            await self.speaker.add_to_active_group(self._active_group_id, guids)
+            await self._add_to_active_group_idempotent(
+                self.speaker, self._active_group_id, guids
+            )
         else:
             await self.speaker.set_active_group(guids)
         self.async_write_ha_state()
@@ -982,7 +1037,7 @@ class BoseMediaPlayer(BoseBaseEntity, MediaPlayerEntity):
         master_entity_id = self._attr_group_members[0]
 
         if self.entity_id == master_entity_id:
-            await self.speaker.stop_active_groups()
+            await self._leave_group_idempotent(self.speaker.stop_active_groups())
         else:
             master_entity = er.async_get(self.hass).async_get(master_entity_id)
             if master_entity is None:
@@ -994,8 +1049,10 @@ class BoseMediaPlayer(BoseBaseEntity, MediaPlayerEntity):
             master_speaker = self.hass.data[DOMAIN][master_entity.config_entry_id][
                 "speaker"
             ]
-            await master_speaker.remove_from_active_group(
-                self._active_group_id, [self._device_id]
+            await self._leave_group_idempotent(
+                master_speaker.remove_from_active_group(
+                    self._active_group_id, [self._device_id]
+                )
             )
 
     def _has_linked_media_player(self) -> bool:

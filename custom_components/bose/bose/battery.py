@@ -73,7 +73,12 @@ class BoseBatteryBase:
             battery_data = await self.coordinator.get_battery_status()
             battery_status = Battery(battery_data)
             self.update_from_battery_status(battery_status)
-            self.async_write_ha_state()
+            # Only write state once the entity is actually registered with a
+            # platform. __init__ schedules this update immediately, so it can
+            # run before async_add_entities has assigned an entity_id; writing
+            # then raises NoEntitySpecifiedError on every single poll.
+            if getattr(self, "entity_id", None):
+                self.async_write_ha_state()
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
                 "Error updating battery status for %s", self.config_entry.data["ip"]
