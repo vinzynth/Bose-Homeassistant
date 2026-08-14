@@ -960,31 +960,38 @@ class BoseMediaPlayer(BoseBaseEntity, MediaPlayerEntity):
                 return
             raise
 
-    @staticmethod
-    async def _leave_group_idempotent(coro) -> None:
+    async def _leave_group_idempotent(self, coro) -> None:
         """Await a group-teardown call, tolerating a group that no longer exists.
 
-        Bose returns HTTP 500 "Error #17 - activeGroupId does not correspond to
-        any known group! Dropping!" when Home Assistant still believes a group
-        exists that the speaker has already torn down (upstream issue #76).
-        The desired end state - this speaker not grouped - already holds, so
-        treat it as success rather than raising and requiring an HA restart.
+        Bose rejects grouping teardown with HTTP 500 and "Bose Error #17" in
+        several wordings, all meaning the same thing - the speaker is not in
+        the grouping state Home Assistant thinks it is:
+
+          - "activeGroupId does not correspond to any known group! Dropping!"
+          - "request not supported in grouping hsm top state"
+
+        Any #17 on a teardown means the desired end state (this speaker not
+        grouped) either already holds or cannot be reached from here, so raising
+        only leaves the user with a group they cannot dissolve without
+        restarting Home Assistant (upstream issue #76).
+
+        We also converge our own view to the device's, because the stale
+        _attr_group_members is what makes the condition sticky: HA keeps
+        offering an unjoin that can never succeed.
         """
         try:
             await coro
         except BoseRequestException as err:
-            text = str(err)
-            if (
-                "does not correspond to any known group" in text
-                or "No changes to active group" in text
-            ):
-                _LOGGER.debug(
-                    "Bose reports no matching active group, "
-                    "treating unjoin as a no-op: %s",
-                    err,
-                )
-                return
-            raise
+            if "Error #17" not in str(err):
+                raise
+            _LOGGER.debug(
+                "Bose rejected group teardown as not applicable, treating as "
+                "a no-op and clearing local group state: %s",
+                err,
+            )
+            self._attr_group_members = []
+            self._active_group_id = None
+            self.async_write_ha_state()
 
     async def async_join_players(self, group_members: list[str]) -> None:
         """Join `group_members` as a player group with the current player."""
